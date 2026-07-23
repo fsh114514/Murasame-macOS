@@ -1,4 +1,4 @@
-# 丛雨
+# 丛雨桌宠 for mac
 
 这是基于 [kuxiaowo/AIpet-Murasame](https://github.com/kuxiaowo/AIpet-Murasame) 和 [LemonQu-GIT/MurasamePet](https://github.com/LemonQu-GIT/MurasamePet) 的个人 macOS Apple Silicon 适配版。
 

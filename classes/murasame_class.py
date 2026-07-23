@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, pyqtSignal
 from PyQt5.QtCore import Qt, QRect
 from PyQt5.QtGui import QGuiApplication, QImage
 from PyQt5.QtGui import QPainter, QColor, QFont, QPixmap, QFontMetrics
@@ -97,6 +97,9 @@ def get_idle_seconds() -> float:
 
 
 class Murasame(QLabel):
+    # 视觉识别在后台线程完成后，通过 Qt 信号回到主线程更新桌宠。
+    visual_prompt_ready = pyqtSignal(str)
+
     # 初始
     def __init__(self):
         super().__init__()
@@ -185,6 +188,7 @@ class Murasame(QLabel):
         self._camera_executor = ThreadPoolExecutor(
             max_workers=1
         )  # 处理摄像头图像网络调用
+        self.visual_prompt_ready.connect(self._start_visual_thread)
         self.force_stop = False  # 是否处于强制中断状态
         if screen_type == "true":
             QTimer.singleShot(
@@ -378,10 +382,25 @@ class Murasame(QLabel):
         return getattr(self, "_dnd_enabled", False)
 
     def on_screenshot_captured(self, image_path):
-        self._on_visual_captured(image_path, source="screen")
+        try:
+            self._on_visual_captured(image_path, source="screen")
+        except Exception as exc:
+            print(f"[AIpet] 屏幕识别任务提交失败: {exc}")
 
     def on_camera_captured(self, image_path):
-        self._on_visual_captured(image_path, source="camera")
+        try:
+            self._on_visual_captured(image_path, source="camera")
+        except Exception as exc:
+            print(f"[AIpet] 摄像头识别任务提交失败: {exc}")
+
+    def _start_visual_thread(self, prompt):
+        """只在 Qt 主线程中启动视觉识别后的对话线程。"""
+        if self.force_stop or self.is_dnd_enabled():
+            return
+        try:
+            self.start_thread(prompt, role="system", t=True)
+        except Exception as exc:
+            print(f"[AIpet] 启动视觉回复失败: {exc}")
 
     def _on_visual_captured(self, image_path, source="screen"):
         # 勿扰模式下完全忽略视觉结果
@@ -411,7 +430,8 @@ class Murasame(QLabel):
                     if self.force_stop:
                         print("屏幕回复 已中断生成")
                         return
-                    self.start_thread(propmt, role="system", t=True)
+                    # 不要从 ThreadPoolExecutor 线程直接操作 Qt 窗口/线程对象。
+                    self.visual_prompt_ready.emit(propmt)
                 except Exception as e:
                     print(f"[AIpet] {source_name}分析失败: {e}")
             finally:
@@ -420,7 +440,10 @@ class Murasame(QLabel):
                 except Exception:
                     pass
 
-        self._screenshot_executor.submit(task, image_path)
+        executor = (
+            self._camera_executor if source == "camera" else self._screenshot_executor
+        )
+        executor.submit(task, image_path)
 
     def pause_all_ai(self):
         """用户输入时：停止截图线程、中断 AI 显示与语音"""

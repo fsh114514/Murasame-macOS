@@ -10,6 +10,7 @@ from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QAction, QActionGroup, QMenu, QMessageBox
 
 from classes.murasame_class import Murasame
+from classes.Worker_class import list_camera_sources
 from api import app as api_app
 import uvicorn
 
@@ -66,7 +67,11 @@ if __name__ == "__main__":
     screens = QApplication.screens()
     target_screen = screens[screen_index]
     geometry = target_screen.availableGeometry()
-    pet.move(geometry.x(), geometry.y())
+    # 首次启动放在目标屏幕右下角，并避开屏幕边缘/Dock 一小段距离。
+    margin = 20
+    initial_x = geometry.right() - pet.width() - margin + 1
+    initial_y = geometry.bottom() - pet.height() - margin + 1
+    pet.move(max(geometry.x(), initial_x), max(geometry.y(), initial_y))
 
     # ===== 手动语音聊天 =====
     # 通过桌宠/托盘菜单启动和停止录音，不监听任何全局键盘。
@@ -186,28 +191,45 @@ if __name__ == "__main__":
     camera_action.setChecked(pet.is_camera_enabled())
     camera_action.toggled.connect(pet.set_camera_enabled)
 
-    # 摄像头来源选择：不同 Mac 上内置摄像头、iPhone 和外接摄像头编号可能不同。
+    # 摄像头来源选择：显示 macOS 返回的真实设备名，避免把 iPhone 误标为内置摄像头。
     camera_source_menu = QMenu("摄像头来源", tray_menu)
-    camera_source_group = QActionGroup(camera_source_menu)
-    camera_source_group.setExclusive(True)
-    camera_source_labels = {
-        0: "摄像头 0（通常是内置摄像头）",
-        1: "摄像头 1（可尝试 iPhone）",
-        2: "摄像头 2",
-        3: "摄像头 3",
-    }
-    for camera_index, label in camera_source_labels.items():
-        source_action = QAction(label, camera_source_menu)
-        source_action.setCheckable(True)
-        source_action.setData(camera_index)
-        source_action.setChecked(pet.get_camera_index() == camera_index)
-        camera_source_group.addAction(source_action)
-        source_action.triggered.connect(
-            lambda _checked, action=source_action: pet.set_camera_index(
-                int(action.data())
-            )
-        )
-    camera_source_menu.addActions(camera_source_group.actions())
+    refresh_camera_sources_action = QAction("刷新摄像头列表", camera_source_menu)
+
+    def rebuild_camera_source_menu():
+        try:
+            # 先移出固定刷新动作，再清理动态设备动作，避免 Qt 删除仍在使用的 QAction。
+            camera_source_menu.removeAction(refresh_camera_sources_action)
+            camera_source_menu.clear()
+            camera_source_menu.addAction(refresh_camera_sources_action)
+            camera_source_menu.addSeparator()
+
+            camera_source_group = QActionGroup(camera_source_menu)
+            camera_source_group.setExclusive(True)
+            sources = list_camera_sources()
+            current_index = pet.get_camera_index()
+            if not any(index == current_index for index, _name in sources):
+                sources.append((current_index, f"当前配置编号 {current_index}（未检测到名称）"))
+
+            for camera_index, device_name in sources:
+                label = f"{device_name}（OpenCV 编号 {camera_index}）"
+                source_action = QAction(label, camera_source_menu)
+                source_action.setCheckable(True)
+                source_action.setData(camera_index)
+                source_action.setChecked(current_index == camera_index)
+                camera_source_group.addAction(source_action)
+                source_action.triggered.connect(
+                    lambda _checked, action=source_action: pet.set_camera_index(
+                        int(action.data())
+                    )
+                )
+
+            camera_source_menu.addActions(camera_source_group.actions())
+        except Exception as exc:
+            print(f"[AIpet][camera] 刷新摄像头菜单失败: {exc}")
+
+    refresh_camera_sources_action.triggered.connect(rebuild_camera_source_menu)
+    camera_source_menu.aboutToShow.connect(rebuild_camera_source_menu)
+    rebuild_camera_source_menu()
 
     clear_action = QAction("Clear History")
     clear_action.triggered.connect(pet.cleer_history)

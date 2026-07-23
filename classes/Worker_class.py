@@ -2,6 +2,7 @@ import json
 import tempfile
 import time
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -12,6 +13,40 @@ from tool.config import get_config
 from tool.chat import qwen3_lora, ollama_qwen3_sentence, ollama_qwen3_portrait, gpt_sovits_tts, ollama_qwen3_emotion, ollama_qwen3_translate
 
 portrait_type = get_config("./config.json")['portrait']
+
+
+def list_camera_sources(max_devices=8):
+    """返回 macOS 当前摄像头名称及其 AVFoundation/OpenCV 编号。
+
+    OpenCV 的裸编号本身没有设备名称，且 Continuity Camera 连接后编号顺序
+    可能变化。macOS 上优先通过 AVFoundation 查询真实名称；查询失败时只
+    返回明确标注为未知的候选编号，不再猜测哪个编号是内置摄像头。
+    """
+    if sys.platform == "darwin":
+        try:
+            import objc
+            from Foundation import NSBundle
+
+            bundle = NSBundle.bundleWithPath_(
+                "/System/Library/Frameworks/AVFoundation.framework"
+            )
+            if bundle is not None:
+                bundle.load()
+            capture_device = objc.lookUpClass("AVCaptureDevice")
+            devices = capture_device.devicesWithMediaType_("vide") or []
+            sources = []
+            for index, device in enumerate(devices):
+                name = str(device.localizedName() or f"摄像头 {index}").strip()
+                sources.append((index, name))
+            if sources:
+                return sources
+        except Exception as exc:
+            print(f"[AIpet][camera] 获取设备名称失败，将使用未知编号: {exc}")
+
+    return [
+        (index, f"OpenCV 摄像头 {index}（设备名称不可用）")
+        for index in range(max_devices)
+    ]
 
 
 class qwen3_lora_Worker(QThread):
@@ -201,12 +236,17 @@ class CameraWorker(QThread):
 
         # 按需打开摄像头：拍完一帧立即释放，等待期间不占用摄像头。
         while not self.isInterruptionRequested():
-            camera = cv2.VideoCapture(self.camera_index)
-            if not camera.isOpened():
-                print(f"[AIpet][camera] 无法打开摄像头 index={self.camera_index}")
-                camera.release()
-            else:
-                try:
+            camera = None
+            try:
+                backend = (
+                    cv2.CAP_AVFOUNDATION
+                    if sys.platform == "darwin"
+                    else cv2.CAP_ANY
+                )
+                camera = cv2.VideoCapture(self.camera_index, backend)
+                if not camera.isOpened():
+                    print(f"[AIpet][camera] 无法打开摄像头 index={self.camera_index}")
+                else:
                     ok, frame = camera.read()
                     if ok and frame is not None:
                         tmp = tempfile.NamedTemporaryFile(
@@ -223,9 +263,16 @@ class CameraWorker(QThread):
                                 pass
                     else:
                         print("[AIpet][camera] 读取摄像头画面失败")
-                finally:
-                    # 无论读取成功与否，都在本轮结束时释放摄像头句柄。
-                    camera.release()
+            except Exception as exc:
+                # 摄像头权限、设备切换或 OpenCV 后端异常不应带崩整个桌宠。
+                print(f"[AIpet][camera] 本轮读取异常，已跳过: {exc}")
+            finally:
+                # 无论读取成功与否，都在本轮结束时释放摄像头句柄。
+                if camera is not None:
+                    try:
+                        camera.release()
+                    except Exception as exc:
+                        print(f"[AIpet][camera] 释放摄像头失败: {exc}")
 
             for _ in range(int(self.interval * 10)):
                 if self.isInterruptionRequested():

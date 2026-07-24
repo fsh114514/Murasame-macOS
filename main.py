@@ -179,6 +179,10 @@ if __name__ == "__main__":
                     if command == "__native_overlay_disable__":
                         native_overlay_action.setChecked(False)
                     else:
+                        # 原生面板不经过 Qt 的 focusIn/focusOut 事件；输入
+                        # 前主动解除输入暂停，确保全屏时仍能生成回复。
+                        print("[AIpet][native-overlay] 收到全屏输入，开始生成回复")
+                        pet.resume_all_ai()
                         pet.start_thread(command, role="user")
         except (OSError, UnicodeError):
             pass
@@ -191,9 +195,13 @@ if __name__ == "__main__":
         native_overlay_state["fullscreen"] = fullscreen
         configure_macos_spaces._native_fullscreen = fullscreen
         if fullscreen:
+            # 隐藏 Qt 窗口不会稳定地产生 focusOutEvent。先恢复自动行为，
+            # 再切换到原生面板，避免全屏后屏幕/摄像头读取被遗留为暂停。
+            pet.resume_all_ai()
             pet.hide()
         else:
             pet.show()
+            pet.resume_all_ai()
 
     def set_native_overlay_enabled(enabled: bool) -> None:
         process = native_overlay_state["process"]

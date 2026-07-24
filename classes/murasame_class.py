@@ -222,17 +222,16 @@ class Murasame(QLabel):
         self._dnd_enabled = False
 
     def focusInEvent(self, event):
-        """当桌宠获得焦点时（用户点中、开始输入）"""
-        # 输入时暂停自动行为，但勿扰模式下保持静默
-        if not self.is_dnd_enabled():
-            self.pause_all_ai()
+        """当桌宠获得焦点时，仅处理 Qt 焦点本身。
+
+        不要在这里暂停 AI：macOS 切换到其它应用的全屏 Space 时，Qt
+        窗口可能先隐藏但不触发稳定的 focusOutEvent，焦点暂停会把屏幕
+        /摄像头线程和视觉回复永久留在暂停状态。
+        """
         super().focusInEvent(event)
 
     def focusOutEvent(self, event):
-        """当桌宠失去焦点时（用户点击别处、输入结束）"""
-        # 仅在未开启勿扰模式时恢复自动行为
-        if not self.is_dnd_enabled():
-            self.resume_all_ai()
+        """当桌宠失去焦点时，仅处理 Qt 焦点本身。"""
         super().focusOutEvent(event)
 
     def start_screenshot_worker(self, interval):
@@ -554,6 +553,10 @@ class Murasame(QLabel):
                     return 0
 
             if index >= len(reply):
+                # 文字/语音回复播放完毕后恢复自动读取。不要依赖窗口
+                # focusOutEvent，因为全屏兼容模式会隐藏 Qt 窗口。
+                if not self.is_dnd_enabled():
+                    self.resume_all_ai()
                 return
             sentence = reply[index]
             portrait = portrait_list[index]
@@ -626,6 +629,10 @@ class Murasame(QLabel):
                 self.head_press_x = event.x()
                 self.setCursor(Qt.OpenHandCursor)
             elif event.y() >= lower_body_threshold:  # 下半身区域 -> 输入模式
+                # 只有真正进入文字输入时才暂停自动行为；窗口焦点变化不能
+                # 作为暂停条件，否则切换其它应用全屏会让桌宠卡在暂停状态。
+                if not self.is_dnd_enabled():
+                    self.pause_all_ai()
                 self.input_mode = True
                 self.input_buffer = ""
                 self.preedit_text = ""
@@ -1002,6 +1009,17 @@ class Murasame(QLabel):
                 self.start_thread(text, role="user")
             else:
                 self.show_text("主人，你说什么？", typing=True)
+                if not self.is_dnd_enabled():
+                    self.resume_all_ai()
+
+        elif event.key() == Qt.Key_Escape:
+            # 取消输入时也要恢复截图/摄像头线程。
+            self.input_mode = False
+            self.input_buffer = ""
+            self.preedit_text = ""
+            self.show_text("", typing=False)
+            if not self.is_dnd_enabled():
+                self.resume_all_ai()
 
         elif event.key() == Qt.Key_Backspace:
             # 如果有拼音候选框，不删（交给输入法处理）

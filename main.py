@@ -2,6 +2,7 @@ import sys
 import threading
 import json
 import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -41,6 +42,77 @@ def save_screen_type(pet: Murasame) -> None:
         print(f"[AIpet] 保存 screen_type 失败: {e}")
 
 
+def configure_macos_spaces() -> None:
+    """让丛雨窗口加入所有 macOS Space，并允许显示在全屏应用上方。"""
+    if sys.platform != "darwin":
+        return
+    try:
+        import AppKit
+
+        NSApp = AppKit.NSApp
+        NSWindowCollectionBehaviorCanJoinAllSpaces = (
+            AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+        )
+        NSWindowCollectionBehaviorCanJoinAllApplications = getattr(
+            AppKit,
+            "NSWindowCollectionBehaviorCanJoinAllApplications",
+            # macOS 26 supports this flag, but older/bundled PyObjC versions
+            # may not export the AppKit constant.  Do not fall back to
+            # FullScreenAuxiliary: that flag does not cover other apps'
+            # fullscreen Spaces.
+            1 << 18,
+        )
+        NSWindowCollectionBehaviorFullScreenAuxiliary = getattr(
+            AppKit, "NSWindowCollectionBehaviorFullScreenAuxiliary", 1 << 8
+        )
+        # 普通 floating level 在某些 macOS 全屏应用下会被压到后面；
+        # status level 是 macOS 给悬浮工具/系统覆盖层使用的层级。
+        NSOverlayWindowLevel = getattr(
+            AppKit,
+            "NSPopUpMenuWindowLevel",
+            getattr(AppKit, "NSStatusWindowLevel", 25),
+        )
+
+        behavior = (
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorCanJoinAllApplications
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        # 不要过滤 isVisible：切换全屏时 macOS 可能先把 QNSWindow 标记为
+        # 不可见，但窗口对象仍然存在，必须继续对它施加全屏行为并重新置前。
+        windows = [
+            window
+            for window in NSApp.windows()
+            if window.title() == "丛雨" or window.className() == "QNSWindow"
+        ]
+        # 原生兼容面板负责真正全屏时的显示；此时不要把已隐藏的 Qt
+        # 窗口重新 orderFront，否则会再次出现两个丛雨。
+        native_fullscreen = getattr(configure_macos_spaces, "_native_fullscreen", False)
+        if native_fullscreen and getattr(configure_macos_spaces, "_native_active", False):
+            return
+        for window in windows:
+            window.setCollectionBehavior_(behavior)
+            window.setLevel_(NSOverlayWindowLevel)
+            window.setHidesOnDeactivate_(False)
+            window.setCanHide_(False)
+            if not window.isVisible():
+                window.orderFrontRegardless()
+        state = (len(windows), behavior, NSOverlayWindowLevel)
+        if getattr(configure_macos_spaces, "_last_state", None) != state:
+            details = "; ".join(
+                f"title={window.title()!r}, class={window.className()}, "
+                f"level={window.level()}, behavior={window.collectionBehavior()}"
+                for window in windows
+            )
+            print(
+                f"[AIpet] 已为 {len(windows)} 个窗口启用跨 Space 和全屏显示 "
+                f"(behavior={behavior}, level={NSOverlayWindowLevel}); {details}"
+            )
+            configure_macos_spaces._last_state = state
+    except Exception as exc:
+        print(f"[AIpet] 跨 Space 设置失败，保留普通置顶: {exc}")
+
+
 if __name__ == "__main__":
 
     # 后台启动本地 API 服务（FastAPI + Uvicorn）
@@ -63,6 +135,126 @@ if __name__ == "__main__":
     pet.setWindowTitle("丛雨")
     app.aboutToQuit.connect(lambda: save_screen_type(pet))
     pet.show()  # 显示窗口
+    QTimer.singleShot(500, configure_macos_spaces)
+    QTimer.singleShot(2000, configure_macos_spaces)
+    spaces_timer = QTimer(pet)
+    spaces_timer.setInterval(1000)
+    spaces_timer.timeout.connect(configure_macos_spaces)
+    spaces_timer.start()
+
+    native_overlay_state = {
+        "process": None,
+        "qt_was_visible": True,
+        "fullscreen": False,
+        "command_mtime": 0,
+    }
+
+    native_overlay_state_path = Path("tmp/native_overlay_fullscreen.state")
+    native_overlay_qt_path = Path("tmp/native_overlay_qt_visible.state")
+    native_overlay_command_path = Path("tmp/native_overlay_command.txt")
+
+    def save_native_qt_visibility() -> None:
+        try:
+            native_overlay_qt_path.parent.mkdir(parents=True, exist_ok=True)
+            native_overlay_qt_path.write_text(
+                "1\n" if pet.isVisible() else "0\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def sync_native_overlay_visibility() -> None:
+        """根据原生面板检测到的全屏状态切换 Qt 交互窗口。"""
+        process = native_overlay_state["process"]
+        if process is None or process.poll() is not None:
+            return
+        save_native_qt_visibility()
+        try:
+            command_stat = native_overlay_command_path.stat()
+            command_mtime = command_stat.st_mtime_ns
+            if command_mtime > native_overlay_state["command_mtime"]:
+                command = native_overlay_command_path.read_text(encoding="utf-8").strip()
+                native_overlay_state["command_mtime"] = command_mtime
+                if command:
+                    native_overlay_command_path.write_text("", encoding="utf-8")
+                    if command == "__native_overlay_disable__":
+                        native_overlay_action.setChecked(False)
+                    else:
+                        pet.start_thread(command, role="user")
+        except (OSError, UnicodeError):
+            pass
+        try:
+            fullscreen = native_overlay_state_path.read_text(encoding="utf-8").strip() == "1"
+        except (OSError, UnicodeError):
+            fullscreen = False
+        if fullscreen == native_overlay_state["fullscreen"]:
+            return
+        native_overlay_state["fullscreen"] = fullscreen
+        configure_macos_spaces._native_fullscreen = fullscreen
+        if fullscreen:
+            pet.hide()
+        else:
+            pet.show()
+
+    def set_native_overlay_enabled(enabled: bool) -> None:
+        process = native_overlay_state["process"]
+        if enabled:
+            if process is not None and process.poll() is None:
+                return
+            overlay_binary = Path(".native_overlay/murasame_overlay")
+            overlay_image = Path("tmp/native_overlay_portrait.png")
+            if not overlay_binary.exists() or not overlay_image.exists():
+                print("[AIpet][native-overlay] 原生面板文件不存在，请重新部署原生组件")
+                native_overlay_action.setChecked(False)
+                return
+            try:
+                native_overlay_state["qt_was_visible"] = pet.isVisible()
+                # 普通桌面保留 Qt 窗口作为交互层；只有原生面板检测到真正
+                # 的全屏窗口后，sync_native_overlay_visibility 才会隐藏它。
+                save_native_qt_visibility()
+                native_overlay_command_path.parent.mkdir(parents=True, exist_ok=True)
+                native_overlay_command_path.write_text("", encoding="utf-8")
+                process = subprocess.Popen(
+                    [
+                        str(overlay_binary.resolve()),
+                        str(overlay_image.resolve()),
+                        str(Path("tmp/native_overlay_text.txt").resolve()),
+                        str(native_overlay_state_path.resolve()),
+                        str(native_overlay_qt_path.resolve()),
+                        str(native_overlay_command_path.resolve()),
+                    ],
+                    cwd=str(Path.cwd()),
+                )
+                native_overlay_state["process"] = process
+                native_overlay_state["fullscreen"] = False
+                configure_macos_spaces._native_active = True
+                configure_macos_spaces._native_fullscreen = False
+                print("[AIpet][native-overlay] 已启用原生全屏兼容模式")
+            except Exception as exc:
+                native_overlay_action.setChecked(False)
+                print(f"[AIpet][native-overlay] 启动失败: {exc}")
+        else:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            native_overlay_state["process"] = None
+            native_overlay_state["fullscreen"] = False
+            configure_macos_spaces._native_active = False
+            configure_macos_spaces._native_fullscreen = False
+            if native_overlay_state["qt_was_visible"]:
+                pet.show()
+            print("[AIpet][native-overlay] 已恢复 Qt 桌宠窗口")
+
+    def stop_native_overlay() -> None:
+        set_native_overlay_enabled(False)
+
+    app.aboutToQuit.connect(stop_native_overlay)
+    native_overlay_timer = QTimer(pet)
+    native_overlay_timer.setInterval(400)
+    native_overlay_timer.timeout.connect(sync_native_overlay_visibility)
+    native_overlay_timer.start()
 
     screens = QApplication.screens()
     target_screen = screens[screen_index]
@@ -211,7 +403,12 @@ if __name__ == "__main__":
                 sources.append((current_index, f"当前配置编号 {current_index}（未检测到名称）"))
 
             for camera_index, device_name in sources:
-                label = f"{device_name}（OpenCV 编号 {camera_index}）"
+                if camera_index == 0:
+                    label = "iPhone（OpenCV 编号 0）"
+                elif camera_index == 1:
+                    label = "内置摄像头（OpenCV 编号 1）"
+                else:
+                    label = f"{device_name}（OpenCV 编号 {camera_index}）"
                 source_action = QAction(label, camera_source_menu)
                 source_action.setCheckable(True)
                 source_action.setData(camera_index)
@@ -239,6 +436,10 @@ if __name__ == "__main__":
 
     visibility_action = QAction("显示/隐藏桌宠")
     visibility_action.triggered.connect(toggle_pet_visibility)
+
+    native_overlay_action = QAction("原生全屏兼容模式")
+    native_overlay_action.setCheckable(True)
+    native_overlay_action.toggled.connect(set_native_overlay_enabled)
 
     memory_action = QAction("长期记忆")
     memory_action.setCheckable(True)
@@ -268,6 +469,7 @@ if __name__ == "__main__":
     tray_menu.addMenu(camera_source_menu)
     tray_menu.addAction(voice_action)
     tray_menu.addAction(visibility_action)
+    tray_menu.addAction(native_overlay_action)
     tray_menu.addAction(clear_action)
     tray_menu.addSeparator()
     tray_menu.addAction(memory_action)
@@ -276,5 +478,8 @@ if __name__ == "__main__":
     tray_menu.addAction(exit_action)
     tray_icon.setContextMenu(tray_menu)
     tray_icon.show()
+
+    # 默认启用原生全屏兼容模式；菜单仍可随时关闭并恢复普通 Qt 桌宠。
+    QTimer.singleShot(800, lambda: native_overlay_action.setChecked(True))
 
     sys.exit(app.exec_())  # 进入事件循环

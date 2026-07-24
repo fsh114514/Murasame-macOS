@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 import textwrap
 import wave
@@ -160,10 +161,11 @@ class Murasame(QLabel):
         self._load_history()
         self._load_memory_summary()
 
-        # 初始立绘
-        self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Window
-        )  # 无边框、真正置顶的普通窗口；Qt.Tool 在 macOS 失焦时可能被隐藏
+        # 初始立绘。macOS 上使用 Tool 会映射为悬浮工具面板，配合
+        # WA_MacAlwaysShowToolWindow 才能在其他应用进入全屏 Space 时继续显示。
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        if sys.platform == "darwin":
+            self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)  # 让整个窗口支持透明区域
         if portrait_type == "a":
             self.first_portrait = [1950, 1368, 1958]
@@ -628,6 +630,7 @@ class Murasame(QLabel):
                 self.input_buffer = ""
                 self.preedit_text = ""
                 self.display_text = f"【{self.user_name}】\n  ..."
+                self._save_native_overlay_text()
                 self.update()
             else:
                 # 其他地方，什么也不做
@@ -797,7 +800,12 @@ class Murasame(QLabel):
     def update_portrait(self, target, layers):
 
         # 1. Generate the RGBA numpy image
-        cv_img = generate_fgimage(target, layers)
+        try:
+            cv_img = generate_fgimage(target, layers)
+        except Exception as exc:
+            # 模型偶尔返回异常图层时保留当前立绘，不让桌宠进程崩溃。
+            print(f"[AIpet][portrait] 立绘图层无效，保留当前立绘: {exc}")
+            return
 
         # 2. Convert RGBA to BGRA to keep colors correct in Qt
         if cv_img.shape[2] == 4:
@@ -819,6 +827,9 @@ class Murasame(QLabel):
         # 4. Convert to QPixmap and apply adaptive scaling
         pixmap = QPixmap.fromImage(qimg).copy()
         self._portrait_source_pixmap = pixmap
+        native_overlay_path = Path("./tmp/native_overlay_portrait.png")
+        native_overlay_path.parent.mkdir(parents=True, exist_ok=True)
+        pixmap.save(str(native_overlay_path), "PNG")
         pixmap = self._scale_portrait_pixmap(pixmap)
 
         # 5. Attach to the QLabel and request a repaint
@@ -887,6 +898,7 @@ class Murasame(QLabel):
                     self.typing_prefix + self.full_text[: self.index + 1]
                 )
                 self.index += 1
+                self._save_native_overlay_text()
                 self.update()
             else:
                 self.typing_timer.stop()
@@ -899,10 +911,21 @@ class Murasame(QLabel):
 
         if typing:
             self.display_text = self.typing_prefix
+            self._save_native_overlay_text()
             self.typing_timer.start(40)
         else:
             self.display_text = self.typing_prefix + text
+            self._save_native_overlay_text()
             self.update()
+
+    def _save_native_overlay_text(self):
+        """同步原生全屏兼容面板显示的对白，失败时不影响桌宠。"""
+        try:
+            text_path = Path("./tmp/native_overlay_text.txt")
+            text_path.parent.mkdir(parents=True, exist_ok=True)
+            text_path.write_text(self.display_text or "", encoding="utf-8")
+        except Exception as exc:
+            print(f"[AIpet][native-overlay] 文字同步失败: {exc}")
 
     # 输入法候选框定位
     def inputMethodQuery(self, query):
@@ -956,6 +979,7 @@ class Murasame(QLabel):
             self.preedit_text = preedit
             wrapped = wrap_text(self.input_buffer + self.preedit_text)
             self.display_text = f"【{self.user_name}】\n  「{wrapped or '...'}」"
+            self._save_native_overlay_text()
             self.update()
         else:
             super().inputMethodEvent(event)
@@ -972,6 +996,7 @@ class Murasame(QLabel):
             self.input_mode = False
             if text:
                 self.display_text = f"【{self.pet_name}】\n"
+                self._save_native_overlay_text()
                 self.update()
                 # 启动 AI 线程
                 self.start_thread(text, role="user")
@@ -987,6 +1012,7 @@ class Murasame(QLabel):
                 self.input_buffer = self.input_buffer[:-1]
                 wrapped = wrap_text(self.input_buffer)
                 self.display_text = f"【{self.pet_name}】\n  「{wrapped or '...'}」"
+                self._save_native_overlay_text()
                 self.update()
 
         else:
@@ -996,6 +1022,7 @@ class Murasame(QLabel):
                 self.input_buffer += ch
                 wrapped = wrap_text(self.input_buffer)
                 self.display_text = f"【{self.pet_name}】\n  「{wrapped or '...'}」"
+                self._save_native_overlay_text()
                 self.update()
 
     def is_memory_enabled(self) -> bool:

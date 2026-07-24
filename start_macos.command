@@ -5,6 +5,14 @@ set -e
 SCRIPT_DIR="${0:A:h}"
 cd "$SCRIPT_DIR"
 
+if [[ -t 1 ]]; then
+  if [[ -f "$SCRIPT_DIR/assets/murasame_terminal.zsh" ]]; then
+    source "$SCRIPT_DIR/assets/murasame_terminal.zsh"
+    print_murasame_terminal_art
+  fi
+  print -r -- $'\e[1;36mCiallo～\e[0m  丛雨桌宠正在启动……'
+fi
+
 if [[ ! -x ".venv/bin/python" ]]; then
   echo "未找到项目虚拟环境，请先完成部署。"
   exit 1
@@ -13,6 +21,22 @@ fi
 if [[ ! -x ".gpt-sovits-venv/bin/python" ]]; then
   echo "未找到 GPT-SoVITS 虚拟环境，请先完成语音合成部署。"
   exit 1
+fi
+
+if [[ -f "native_overlay/murasame_overlay.m" && ! -x ".native_overlay/murasame_overlay" ]]; then
+  mkdir -p .native_overlay
+  if command -v clang >/dev/null 2>&1; then
+    echo "正在编译 macOS 原生全屏兼容组件..."
+    clang -fobjc-arc -framework Cocoa native_overlay/murasame_overlay.m \
+      -o .native_overlay/murasame_overlay || echo "原生全屏组件编译失败，普通模式仍可使用。"
+  fi
+fi
+
+# 防止重复启动多个丛雨实例。重复实例会争抢 28565 端口，并导致
+# macOS 全屏 Space 中显示的是旧窗口或多个互相覆盖的窗口。
+if lsof -nP -iTCP:28565 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "检测到丛雨已经在运行，请从菜单栏退出旧实例后再启动。"
+  exit 0
 fi
 
 tts_pid=""

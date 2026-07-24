@@ -15,6 +15,37 @@ from tool.chat import qwen3_lora, ollama_qwen3_sentence, ollama_qwen3_portrait, 
 portrait_type = get_config("./config.json")['portrait']
 
 
+def normalize_portrait_layers(value, sentence_count):
+    """把模型返回的立绘图层统一成“每句话一个图层列表”。"""
+    fallback = [1715, 1306, 1719] if portrait_type == "b" else [1950, 1368, 1958]
+    if isinstance(value, int):
+        value = [value]
+    if not isinstance(value, list):
+        value = []
+    # 模型偶尔返回 [1715, 1306, 1719]，表示单句图层，而不是多句结果。
+    if value and all(isinstance(item, (int, str)) for item in value):
+        value = [value]
+
+    normalized = []
+    for layers in value:
+        if isinstance(layers, (int, str)):
+            layers = [layers]
+        if not isinstance(layers, list):
+            continue
+        try:
+            layers = [int(layer) for layer in layers]
+        except (TypeError, ValueError):
+            continue
+        if layers:
+            normalized.append(layers)
+
+    if not normalized:
+        normalized = [fallback]
+    while len(normalized) < max(1, sentence_count):
+        normalized.append(list(normalized[-1]))
+    return normalized[:max(1, sentence_count)]
+
+
 def list_camera_sources(max_devices=8):
     """返回 macOS 当前摄像头名称及其 AVFoundation/OpenCV 编号。
 
@@ -39,6 +70,26 @@ def list_camera_sources(max_devices=8):
                 name = str(device.localizedName() or f"摄像头 {index}").strip()
                 sources.append((index, name))
             if sources:
+                # 在当前 Mac 上，OpenCV 的实际顺序与 AVFoundation 名称顺序相反：
+                # OpenCV 0 是 iPhone，OpenCV 1 是内置摄像头。按设备特征修正菜单标签，
+                # 避免用户选择“内置摄像头”时实际打开 iPhone。
+                iphone = next(
+                    (name for _index, name in sources if "iphone" in name.lower()),
+                    None,
+                )
+                builtin = next(
+                    (
+                        name
+                        for _index, name in sources
+                        if any(
+                            marker in name.lower()
+                            for marker in ("built-in", "builtin", "facetime", "内置")
+                        )
+                    ),
+                    None,
+                )
+                if iphone and builtin and len(sources) == 2:
+                    return [(0, iphone), (1, builtin)]
                 return sources
         except Exception as exc:
             print(f"[AIpet][camera] 获取设备名称失败，将使用未知编号: {exc}")
@@ -144,7 +195,18 @@ class cloud_API_Worker(QThread):
 
         # 1. 先获取对话回复（这个必须串行，因为依赖前面的历史）
         if self.force_stop:print("[deepseek] 已中断生成。");return
-        reply, history = cloud_talk(self.history, self.user_input, self.role)
+        try:
+            reply, history = cloud_talk(self.history, self.user_input, self.role)
+        except Exception as exc:
+            print(f"[AIpet][cloud] 对话请求失败，保留桌宠运行: {exc}")
+            self.finished.emit(
+                ["网络暂时有些拥挤，主人稍后再和本座说话吧。"],
+                [],
+                self.history,
+                self.portrait_history,
+                [],
+            )
+            return
         # 2. 使用线程池并发执行所有 DeepSeek 任务和 TTS 任务
         if self.force_stop:print("[deepseek] 已中断生成。");return
         with ThreadPoolExecutor(max_workers=5) as executor:  # 增加线程数
@@ -164,6 +226,7 @@ class cloud_API_Worker(QThread):
         emotion_list = to_list(emotion_result)
         portrait_list = to_list(portrait_result)
         reply_list = to_list(reply)
+        portrait_list = normalize_portrait_layers(portrait_list, len(reply_list))
         # 4. 并发执行所有TTS任务
         voices = []
         with ThreadPoolExecutor(max_workers=3) as tts_executor:
